@@ -208,9 +208,13 @@ def sanitize_filename(filename: str) -> str:
 def find_existing_folder_for_title(title: str) -> Optional[Path]:
     """
     Finds matching folder in OUTPUT_DIR by title, tolerating sanitized filenames
-    and common numbering/custom prefixes (e.g. 'D1 ', 'D3 ').
+    and common numbering/custom prefixes (e.g. 'D1 ', 'D3 ', 'part 1 ').
+    Never falsely cross-matches distinct folders that share a common prefix.
     """
-    # 1. Exact match
+    if not OUTPUT_DIR.exists():
+        return None
+
+    # 1. Exact direct matches
     exact = OUTPUT_DIR / title
     if exact.is_dir():
         return exact
@@ -220,15 +224,30 @@ def find_existing_folder_for_title(title: str) -> Optional[Path]:
     if sanitized_dir.is_dir():
         return sanitized_dir
 
-    # 2. Match ignoring custom prefixes
-    clean_title = re.sub(r"^(D\d+|part\s*\d+)\s*", "", title, flags=re.IGNORECASE).strip()
+    title_lower = title.strip().lower()
+    clean_title = re.sub(r"^(d\d+|part\s*\d+)\s*", "", title_lower, flags=re.IGNORECASE).strip()
+
+    # Pass 1: Exact case-insensitive match
     for item in OUTPUT_DIR.iterdir():
         if item.is_dir() and not item.name.endswith("_FAILED"):
-            clean_item = re.sub(r"^(D\d+|part\s*\d+)\s*", "", item.name, flags=re.IGNORECASE).strip()
+            if item.name.strip().lower() == title_lower:
+                return item
+
+    # Pass 2: Exact match after stripping common prefix (e.g. 'D3 ')
+    for item in OUTPUT_DIR.iterdir():
+        if item.is_dir() and not item.name.endswith("_FAILED"):
+            clean_item = re.sub(r"^(d\d+|part\s*\d+)\s*", "", item.name.strip().lower(), flags=re.IGNORECASE).strip()
             if clean_item == clean_title:
                 return item
-            if len(clean_title) > 20 and (clean_title[:25] in clean_item or clean_item[:25] in clean_title):
+
+    # Pass 3: Sanitized match after stripping prefix
+    clean_title_sanitized = sanitize_filename(clean_title)
+    for item in OUTPUT_DIR.iterdir():
+        if item.is_dir() and not item.name.endswith("_FAILED"):
+            clean_item = re.sub(r"^(d\d+|part\s*\d+)\s*", "", item.name.strip().lower(), flags=re.IGNORECASE).strip()
+            if sanitize_filename(clean_item) == clean_title_sanitized:
                 return item
+
     return None
 
 
@@ -319,29 +338,55 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
     logger.info(f"[{index}/{total}] [UPDATE] Checking {len(remote_files)} files in '{matched_dir.name[:35]}'...")
 
     session = requests.Session()
+    if use_cookies and COOKIES_FILE.exists():
+        try:
+            cj = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
+            cj.load()
+            session.cookies = cj
+        except Exception as e:
+            logger.warning(f"Could not load cookies into update session: {e}")
     session.headers["User-Agent"] = USER_AGENT
+    adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     to_download = []
 
     def check_file(f):
-        lp = matched_dir / f.path
-        if not lp.exists():
-            candidates = list(matched_dir.rglob(Path(f.path).name))
-            if candidates:
-                lp = candidates[0]
-            else:
-                return f, lp, "NEW_FILE", 0, None
-        l_size = lp.stat().st_size
-        l_mtime = lp.stat().st_mtime
-        r_size, r_mtime = get_remote_file_metadata(f.id, session)
-        if r_size > 0 and r_size != l_size:
-            return f, lp, f"SIZE_DIFF ({l_size}B -> {r_size}B)", r_size, r_mtime
-        if r_mtime and r_mtime > l_mtime + 5:
-            return f, lp, "TIME_MODIFIED (newer on Drive)", r_size, r_mtime
-        return f, lp, "UP_TO_DATE", r_size, r_mtime
+        try:
+            lp = matched_dir / f.path
+            if not lp.exists():
+                candidates = [p for p in matched_dir.rglob("*") if p.is_file() and p.name.lower() == Path(f.path).name.lower()]
+                if candidates:
+                    lp = candidates[0]
+                else:
+                    return f, lp, "NEW_FILE", 0, None
+            l_size = lp.stat().st_size
+            l_mtime = lp.stat().st_mtime
+            r_size, r_mtime = get_remote_file_metadata(f.id, session)
 
+            if r_size > 0 and r_size != l_size:
+                return f, lp, f"SIZE_DIFF ({l_size}B -> {r_size}B)", r_size, r_mtime
+            if r_mtime and r_mtime > l_mtime + 2:
+                return f, lp, "TIME_MODIFIED (newer on Drive)", r_size, r_mtime
+            if r_size == 0 and l_size < 1024 * 1024:
+                return f, lp, "UNVERIFIED_SMALL_FILE", r_size, r_mtime
+            return f, lp, "UP_TO_DATE", r_size, r_mtime
+        except Exception as err:
+            logger.warning(f"Error inspecting {getattr(f, 'path', str(f))}: {err}")
+            return f, matched_dir / getattr(f, "path", str(f)), "CHECK_ERROR", 0, None
+
+    results = []
     with ThreadPoolExecutor(max_workers=6) as executor:
-        results = list(executor.map(check_file, remote_files))
+        future_to_f = {executor.submit(check_file, f): f for f in remote_files}
+        for future in future_to_f:
+            try:
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                f_item = future_to_f[future]
+                logger.warning(f"Error checking {getattr(f_item, 'path', 'file')}: {e}")
+                results.append((f_item, matched_dir / getattr(f_item, "path", "file"), "ERROR_FALLBACK", 0, None))
 
     for f, lp, status, r_size, r_mtime in results:
         if status != "UP_TO_DATE":
@@ -365,6 +410,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
                 output=str(lp),
                 quiet=QUIET,
                 use_cookies=use_cookies,
+                cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
                 user_agent=USER_AGENT,
             )
             if r_mtime:
