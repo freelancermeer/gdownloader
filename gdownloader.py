@@ -124,11 +124,25 @@ def get_remote_folder_info(folder_id: str, timeout: int = 12) -> Tuple[Optional[
         return None, 0, False
 
 
-def get_remote_file_metadata(file_id: str, session: requests.Session) -> Tuple[Optional[int], Optional[float], bool]:
+def get_remote_file_metadata(file_id: str, session: requests.Session, filename: str = "") -> Tuple[Optional[int], Optional[float], bool]:
     """
     Returns (remote_size_bytes, remote_mtime_epoch, is_quota_exceeded) for a Google Drive file.
     Guarantees that HTML error pages (Quota exceeded, login redirects) are NEVER mistaken for file sizes.
+    For images, queries Google's high-speed CDN to bypass 24h download quota limits completely.
     """
+    is_image = any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
+    if is_image:
+        try:
+            cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+            cdn_r = session.head(cdn_url, allow_redirects=True, timeout=8)
+            ct = cdn_r.headers.get("Content-Type", "").lower()
+            if cdn_r.status_code == 200 and "image/" in ct:
+                cl = int(cdn_r.headers.get("Content-Length", 0))
+                if cl > 0:
+                    return cl, None, False
+        except Exception:
+            pass
+
     url = f"https://drive.google.com/uc?id={file_id}"
     try:
         r = session.get(url, stream=True, allow_redirects=True, timeout=12)
@@ -392,14 +406,14 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
                 if candidates:
                     lp = candidates[0]
                 else:
-                    r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session)
+                    r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session, filename=f.path)
                     if is_quota:
                         return f, lp, "QUOTA_EXCEEDED", None, None
                     return f, lp, "NEW_FILE", r_size, r_mtime
 
             l_size = lp.stat().st_size
             l_mtime = lp.stat().st_mtime
-            r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session)
+            r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session, filename=f.path)
 
             if is_quota:
                 # File already exists locally. Remote is temporarily quota-locked by Google.
@@ -448,29 +462,50 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
             continue
         logger.info(f"  -> Updating: {f.path} [{reason}]")
         lp.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            gdown.download(
-                url=f"https://drive.google.com/uc?id={f.id}",
-                output=str(lp),
-                quiet=QUIET,
-                use_cookies=use_cookies,
-                cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
-                user_agent=USER_AGENT,
-            )
-            if r_mtime:
-                try:
-                    os.utime(lp, (r_mtime, r_mtime))
-                except Exception:
-                    pass
-            updated_count += 1
-        except (FileURLRetrievalError, DownloadError) as e:
-            err_str = str(e)
-            if "Too many users" in err_str or "quota" in err_str.lower():
-                logger.warning(f"  [!] Quota exceeded for {f.path}. Existing local file preserved.")
-            else:
-                logger.warning(f"  [!] Failed to update {f.path}: {err_str.splitlines()[0] if err_str else e}")
-        except Exception as e:
-            logger.warning(f"  [!] Failed to update {f.path}: {e}")
+
+        # For images, download directly from Google high-speed CDN to bypass quota limits
+        is_image = any(str(lp).lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
+        downloaded = False
+        if is_image:
+            try:
+                cdn_url = f"https://lh3.googleusercontent.com/d/{f.id}"
+                cdn_res = session.get(cdn_url, stream=True, timeout=15)
+                ct = cdn_res.headers.get("Content-Type", "").lower()
+                if cdn_res.status_code == 200 and "image/" in ct:
+                    with open(lp, "wb") as out_f:
+                        for chunk in cdn_res.iter_content(chunk_size=32768):
+                            if chunk:
+                                out_f.write(chunk)
+                    cdn_res.close()
+                    downloaded = True
+                    updated_count += 1
+            except Exception:
+                pass
+
+        if not downloaded:
+            try:
+                gdown.download(
+                    url=f"https://drive.google.com/uc?id={f.id}",
+                    output=str(lp),
+                    quiet=QUIET,
+                    use_cookies=use_cookies,
+                    cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+                    user_agent=USER_AGENT,
+                )
+                if r_mtime:
+                    try:
+                        os.utime(lp, (r_mtime, r_mtime))
+                    except Exception:
+                        pass
+                updated_count += 1
+            except (FileURLRetrievalError, DownloadError) as e:
+                err_str = str(e)
+                if "Too many users" in err_str or "quota" in err_str.lower():
+                    logger.warning(f"  [!] Quota exceeded for {f.path}. Existing local file preserved.")
+                else:
+                    logger.warning(f"  [!] Failed to update {f.path}: {err_str.splitlines()[0] if err_str else e}")
+            except Exception as e:
+                logger.warning(f"  [!] Failed to update {f.path}: {e}")
 
     logger.info(f"[{index}/{total}] [UPDATE] Completed: {updated_count}/{len(to_download)} file(s) downloaded.")
     return True, False
