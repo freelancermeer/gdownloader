@@ -1,0 +1,21 @@
+# Google Drive authentication cookies (private session tokens)
+cookies.txt
+
+# Local execution logs
+download_log.txt
+
+# Downloaded files & heavy assets (Git ignores contents, tracks folder via .gitkeep)
+Download Data/*
+!Download Data/.gitkeep
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.part
+*.tmp
+.idea/
+.vscode/
+.venv/
+env/
+venv/

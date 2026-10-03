@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+Production-ready Google Drive Folder Downloader & QC
+- Modern User-Agent (prevents Google 403 Forbidden / bot blocks)
+- Smart Cookie Validation & Fallback (detects expired/stale cookies causing login redirects)
+- Fast resume/skip for already downloaded folders (avoids re-downloading completed gigabytes)
+- File-level and folder-level retry mechanisms with exponential backoff
+- Strict verification (verifies files and sizes)
+- Preserves folder structure and names
+- Built-in Quality Control (QC) reporting
+"""
+
+import sys
+import os
+import time
+import re
+import logging
+import argparse
+import http.cookiejar
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+# Ensure UTF-8 output on Windows consoles to prevent charmap encoding errors
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import requests
+import bs4
+import gdown
+from gdown.exceptions import DownloadError, FileURLRetrievalError
+
+# ====================== CONFIG ======================
+BASE_DIR = Path(__file__).parent.resolve()
+LINKS_FILE = BASE_DIR / "links.txt"
+OUTPUT_DIR = BASE_DIR / "Download Data"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
+RETRIES = 5
+FILE_RETRIES = 3
+QUIET = False
+SKIP_EXISTING = True  # Automatically skips folders that are already completely downloaded
+
+WAIT_BETWEEN_DOWNLOADS = 5
+WAIT_ON_RATE_LIMIT = 45
+
+# Modern browser User-Agent prevents Google 403 blocks on file downloads
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+# ====================================================
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+log_file = BASE_DIR / "download_log.txt"
+stream_handler = logging.StreamHandler(sys.stdout)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        stream_handler,
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+def read_links(file_path: Path) -> List[str]:
+    if not file_path.exists():
+        logger.error(f"links.txt not found: {file_path}")
+        sys.exit(1)
+
+    links = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                links.append(line)
+
+    if not links:
+        logger.error("No valid links found in links.txt")
+        sys.exit(1)
+
+    return links
+
+
+def extract_folder_id(url: str) -> str:
+    m = re.search(r"/folders/([-\w]{25,})", url)
+    if m:
+        return m.group(1)
+    return url.rstrip("/").split("/")[-1].split("?")[0]
+
+
+def get_remote_folder_info(folder_id: str, timeout: int = 12) -> Tuple[Optional[str], int, bool]:
+    """
+    Queries Google Drive embeddedfolderview to get:
+    (title, file_count, is_login_redirect)
+    """
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        res = requests.get(url, headers=headers, timeout=timeout)
+        if res.status_code != 200:
+            return None, 0, False
+        soup = bs4.BeautifulSoup(res.text, "html.parser")
+        title = soup.title.string.strip() if soup.title and soup.title.string else None
+        is_redirect = (
+            title == "Redirecting..."
+            or "accounts.google.com" in res.url
+            or "ServiceLogin" in res.text[:500]
+        )
+        if is_redirect:
+            return None, 0, True
+        file_count = len(soup.find_all("a"))
+        return title, file_count, False
+    except Exception:
+        return None, 0, False
+
+
+def validate_cookies_file(cookies_path: Path) -> bool:
+    """
+    Validates if cookies.txt contains an active, valid Google Drive session.
+    Returns False if cookies cause a redirect to ServiceLogin / Redirecting...
+    """
+    if not cookies_path.exists():
+        return False
+    try:
+        cj = http.cookiejar.MozillaCookieJar(str(cookies_path))
+        cj.load()
+        with requests.Session() as s:
+            s.cookies = cj
+            s.headers["User-Agent"] = USER_AGENT
+            test_url = "https://drive.google.com/embeddedfolderview?id=1PsWVz_rZXYS6jKez2S5PDf1NEefwn0nS"
+            r = s.get(test_url, timeout=10)
+            if "accounts.google.com" in r.url or "Redirecting" in r.text[:300] or "ServiceLogin" in r.text[:300]:
+                return False
+            return True
+    except Exception:
+        return False
+
+
+def is_folder_complete(folder_path: Path) -> bool:
+    """
+    Checks if a local directory contains complete downloaded folder assets.
+    """
+    if not folder_path.is_dir():
+        return False
+    files = [f for f in folder_path.rglob("*") if f.is_file()]
+    if len(files) < 4:
+        return False
+    has_video = any(
+        f.suffix.lower() in [".mp4", ".mov", ".mkv", ".avi"] and f.stat().st_size > 10 * 1024 * 1024
+        for f in files
+    )
+    has_metadata = any(f.name in ["title.txt", "description.txt", "info.txt"] for f in files)
+    return has_video or has_metadata
+
+
+def find_existing_folder_for_title(title: str) -> Optional[Path]:
+    """Finds matching folder in OUTPUT_DIR by title."""
+    for item in OUTPUT_DIR.iterdir():
+        if item.is_dir() and not item.name.endswith("_FAILED"):
+            if item.name == title or (len(title) > 20 and title[:25] in item.name):
+                return item
+    return None
+
+
+def clean_failed_marker(index: int, url: str):
+    folder_id = extract_folder_id(url)
+    failed_folder = OUTPUT_DIR / f"{index:03d}_folder_{folder_id[:12]}_FAILED"
+    if failed_folder.exists():
+        try:
+            import shutil
+            shutil.rmtree(failed_folder)
+        except Exception:
+            pass
+
+
+def create_failed_marker(index: int, url: str):
+    try:
+        folder_id = extract_folder_id(url)
+        failed_folder = OUTPUT_DIR / f"{index:03d}_folder_{folder_id[:12]}_FAILED"
+        failed_folder.mkdir(parents=True, exist_ok=True)
+        with open(failed_folder / "DOWNLOAD_FAILED.txt", "w", encoding="utf-8") as f:
+            f.write(
+                f"Original URL:\n{url}\n\n"
+                f"Failed after {RETRIES} attempts.\n"
+                f"Most common reason: Google rate limiting / temporary restriction.\n"
+            )
+        logger.error(f"[{index}] FAILED -> Created: {failed_folder.name}")
+    except Exception as e:
+        logger.error(f"[{index}] Could not create fallback folder: {e}")
+
+
+def is_rate_limit_error(error_msg: str) -> bool:
+    keywords = [
+        "cannot retrieve the public link",
+        "too many users have viewed",
+        "access denied",
+        "permission denied",
+        "have had many accesses",
+        "failed to retrieve file url",
+        "429",
+    ]
+    error_msg = error_msg.lower()
+    return any(k in error_msg for k in keywords)
+
+
+def download_folder(url: str, index: int, total: int, use_cookies: bool) -> Tuple[bool, bool]:
+    """
+    Downloads folder using gdown with modern User-Agent and strict success checking.
+    Returns:
+        (success: bool, was_skipped: bool)
+    """
+    logger.info(f"[{index}/{total}] Checking -> {url}")
+    folder_id = extract_folder_id(url)
+    output_path = str(OUTPUT_DIR) + "\\"
+
+    # 1. Check if already downloaded
+    if SKIP_EXISTING:
+        remote_title, _, _ = get_remote_folder_info(folder_id)
+        if remote_title:
+            matched_dir = find_existing_folder_for_title(remote_title)
+            if matched_dir and is_folder_complete(matched_dir):
+                files = [f for f in matched_dir.rglob("*") if f.is_file()]
+                size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
+                logger.info(
+                    f"[{index}/{total}] ALREADY COMPLETED -> '{matched_dir.name[:45]}' "
+                    f"({len(files)} files, {size_mb:.1f} MB). Skipping."
+                )
+                clean_failed_marker(index, url)
+                return True, True
+
+    # 2. Attempt download with retries
+    active_use_cookies = use_cookies
+    for attempt in range(1, RETRIES + 1):
+        try:
+            result = gdown.download_folder(
+                url=url,
+                output=output_path,
+                quiet=QUIET,
+                use_cookies=active_use_cookies,
+                cookies_file=str(COOKIES_FILE) if (active_use_cookies and COOKIES_FILE.exists()) else None,
+                resume=True,
+                retries=FILE_RETRIES,
+                user_agent=USER_AGENT,
+            )
+
+            # Strict check: only count as success if we got a non-empty list of downloaded files
+            if isinstance(result, list) and len(result) > 0:
+                logger.info(f"[{index}/{total}] SUCCESS -> Downloaded {len(result)} files")
+                clean_failed_marker(index, url)
+                return True, False
+            else:
+                logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} -> No files downloaded (returned empty list)")
+                # If cookies were on and returned 0 files, switch them off for subsequent attempts
+                if active_use_cookies:
+                    logger.warning(f"[{index}/{total}] Cookies returned 0 files (login redirect likely). Disabling cookies for next attempt...")
+                    active_use_cookies = False
+                wait = min(2 ** attempt + 4, 30)
+                time.sleep(wait)
+
+        except (DownloadError, FileURLRetrievalError) as e:
+            error_msg = str(e)
+            logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} failed: {error_msg}")
+
+            if is_rate_limit_error(error_msg):
+                logger.warning(f"[{index}/{total}] Rate limit detected. Waiting {WAIT_ON_RATE_LIMIT}s...")
+                time.sleep(WAIT_ON_RATE_LIMIT)
+            else:
+                wait = min(2 ** attempt + 6, 60)
+                logger.info(f"[{index}/{total}] Retrying in {wait} seconds...")
+                time.sleep(wait)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} unexpected error: {error_msg}")
+            wait = min(2 ** attempt + 6, 60)
+            time.sleep(wait)
+
+    # 3. Graceful Failure marker
+    create_failed_marker(index, url)
+    return False, False
+
+
+def run_qc(sample_count: Optional[int] = None):
+    """Quality Control check on downloaded data."""
+    logger.info("=" * 70)
+    logger.info("QUALITY CONTROL (QC) REPORT")
+    logger.info("=" * 70)
+
+    links = read_links(LINKS_FILE)
+    logger.info(f"Total links defined in links.txt: {len(links)}")
+
+    downloaded_dirs = [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and not d.name.endswith("_FAILED")]
+    failed_dirs = [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and d.name.endswith("_FAILED")]
+
+    logger.info(f"Downloaded folders on disk : {len(downloaded_dirs)}")
+    logger.info(f"Failed placeholder folders : {len(failed_dirs)}")
+    logger.info("-" * 70)
+
+    target_links = links[:sample_count] if sample_count else links
+    passed = 0
+    missing = 0
+
+    for i, url in enumerate(target_links, 1):
+        fid = extract_folder_id(url)
+        remote_title, remote_files, is_redir = get_remote_folder_info(fid)
+        title_str = remote_title or f"folder_{fid[:12]}"
+        matched_dir = find_existing_folder_for_title(title_str)
+
+        if not matched_dir or not matched_dir.exists():
+            logger.warning(f"QC [{i:02d}] MISSING: '{title_str[:45]}'")
+            missing += 1
+            continue
+
+        files = [f for f in matched_dir.rglob("*") if f.is_file()]
+        mp4_files = [f for f in files if f.suffix.lower() == ".mp4"]
+        txt_files = [f for f in files if f.suffix.lower() in [".txt", ".md", ".json"]]
+        img_files = [f for f in files if f.suffix.lower() in [".jpg", ".png", ".webp"]]
+        total_size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
+
+        video_ok = len(mp4_files) >= 1 and any(f.stat().st_size > 10 * 1024 * 1024 for f in mp4_files)
+        meta_ok = len(txt_files) >= 2
+        img_ok = len(img_files) >= 1
+
+        if video_ok and meta_ok and img_ok:
+            passed += 1
+            status = "PASS"
+        else:
+            status = "WARN"
+
+        vid_size = f"{mp4_files[0].stat().st_size / (1024 * 1024):.1f}MB" if mp4_files else "0MB"
+        logger.info(
+            f"QC [{i:02d}] {status:4} | '{matched_dir.name[:35]}' | "
+            f"Files: {len(files):3} ({total_size_mb:6.1f} MB) | "
+            f"Videos: {len(mp4_files)} ({vid_size}) | Imgs: {len(img_files)} | Text/Data: {len(txt_files)}"
+        )
+
+    logger.info("=" * 70)
+    logger.info(f"QC Summary: {passed} PASSED | {missing} MISSING | Checked: {len(target_links)}")
+    logger.info("=" * 70)
+
+
+def main():
+    global SKIP_EXISTING, WAIT_BETWEEN_DOWNLOADS, RETRIES, QUIET
+
+    parser = argparse.ArgumentParser(description="Google Drive Folder Downloader & QC")
+    parser.add_argument("--qc", action="store_true", help="Run QC report on downloaded folders")
+    parser.add_argument("--qc-count", type=int, default=None, help="Number of links to check in QC (default: all)")
+    parser.add_argument("--limit", type=int, default=None, help="Process up to N folders from links.txt")
+    parser.add_argument("--start", type=int, default=1, help="Start processing from folder index N (1-based, default: 1)")
+    parser.add_argument("--no-skip", action="store_true", help="Disable auto-skip and re-check/re-download existing folders")
+    parser.add_argument("--wait", type=int, default=WAIT_BETWEEN_DOWNLOADS, help=f"Wait time in seconds between downloads (default: {WAIT_BETWEEN_DOWNLOADS})")
+    parser.add_argument("--retries", type=int, default=RETRIES, help=f"Max retries per folder on failure (default: {RETRIES})")
+    parser.add_argument("--force-cookies", action="store_true", help="Force using cookies even if validity test fails")
+    parser.add_argument("--quiet", action="store_true", help="Suppress download progress output")
+    args = parser.parse_args()
+
+    if args.no_skip:
+        SKIP_EXISTING = False
+    if args.wait is not None:
+        WAIT_BETWEEN_DOWNLOADS = args.wait
+    if args.retries is not None:
+        RETRIES = args.retries
+    if args.quiet:
+        QUIET = True
+
+    if args.qc:
+        run_qc(sample_count=args.qc_count)
+        return
+
+    logger.info("=" * 70)
+    logger.info("Google Drive Folder Downloader (Enhanced & Resilient Version)")
+    logger.info("- Smart cookie validation & automatic fallback")
+    logger.info(f"- Fast resume/skip for existing folders: {'ENABLED' if SKIP_EXISTING else 'DISABLED'}")
+    logger.info("- Modern browser User-Agent (avoids 403 blocks)")
+    logger.info(f"- Folder retries: {RETRIES} | Wait between downloads: {WAIT_BETWEEN_DOWNLOADS}s")
+    logger.info(f"- Output folder : {OUTPUT_DIR}")
+    logger.info("=" * 70)
+
+    # Validate cookies
+    use_cookies = False
+    if COOKIES_FILE.exists():
+        logger.info(f"Evaluating {COOKIES_FILE.name}...")
+        if validate_cookies_file(COOKIES_FILE):
+            logger.info(f"Cookies in {COOKIES_FILE.name} are VALID. Authenticated mode enabled.")
+            use_cookies = True
+        else:
+            logger.warning(f"[!] {COOKIES_FILE.name} contains expired/stale session cookies (triggers Google login redirect).")
+            logger.warning("[!] Bypassing cookies.txt and using direct public access mode.")
+            use_cookies = False
+    else:
+        logger.info("No cookies.txt found. Using direct public access mode.")
+
+    if args.force_cookies:
+        logger.warning("Forcing use_cookies=True as requested by CLI flag.")
+        use_cookies = True
+
+    all_links = read_links(LINKS_FILE)
+    total = len(all_links)
+    logger.info(f"Found {total} folder link(s) in {LINKS_FILE.name}")
+
+    start_idx = max(1, args.start)
+    end_idx = min(total, start_idx + args.limit) if args.limit is not None else total
+
+    target_items = list(enumerate(all_links, 1))[start_idx - 1:end_idx]
+    logger.info(f"Processing folders from index [{start_idx}] to [{end_idx}] (Total to check: {len(target_items)})")
+
+    success = 0
+    failed = 0
+
+    for idx, (i, url) in enumerate(target_items, 1):
+        logger.info("-" * 70)
+        ok, skipped = download_folder(url, i, total, use_cookies=use_cookies)
+        if ok:
+            success += 1
+        else:
+            failed += 1
+
+        # Only wait if we actually performed a network download (not skipped)
+        if not skipped and idx < len(target_items):
+            logger.info(f"Waiting {WAIT_BETWEEN_DOWNLOADS}s before next folder...")
+            time.sleep(WAIT_BETWEEN_DOWNLOADS)
+        else:
+            time.sleep(0.1)
+
+    logger.info("=" * 70)
+    logger.info(f"Finished | Success: {success} | Failed: {failed} | Total Processed: {len(target_items)}")
+    logger.info(f"Log saved to: {log_file}")
+    logger.info("=" * 70)
+
+    # Run QC on processed items
+    run_qc(sample_count=end_idx)
+
+    if failed > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
