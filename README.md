@@ -8,6 +8,7 @@ A resilient, production-ready bulk Google Drive folder downloader and Quality Co
 
 - **Automated Anti-Blocking:** Injects modern desktop User-Agents to prevent Google's 403 Forbidden / bot detection on direct downloads.
 - **Smart Cookie Validation:** Automatically checks if `cookies.txt` has valid active tokens or causes a redirect to Google ServiceLogin, gracefully falling back to public mode if cookies are stale.
+- **Incremental Folder Sync (`--update`):** Queries remote file metadata (size and modification timestamp) and downloads only modified or newly added files, while skipping already up-to-date large media files.
 - **Smart Skip & Resume:** Detects completed folders in milliseconds to prevent re-downloading gigabytes of existing data.
 - **Built-in Quality Control (QC):** Validates downloaded content, verifying videos (`.mp4`), thumbnails, and text metadata.
 - **Zero Extra Files:** Single worker script design configurable via command-line flags and parameters.
@@ -52,12 +53,19 @@ Verify all downloaded folders without downloading:
 python gdownloader.py --qc
 ```
 
+### 3. Incremental Update & Sync
+Check remote Google Drive folders for updated or newly added files. It downloads only files that have changed or are new, safely skipping existing large video files and matching files:
+```bash
+python gdownloader.py --update
+```
+
 ---
 
 ## Command-Line Flags & Parameters
 
 | Flag | Argument | Default | Description |
 |---|---|---|---|
+| `--update` | None | `False` | Incremental sync: check remote files and download only new or modified files. |
 | `--qc` | None | `False` | Run Quality Control verification report on downloaded folders. |
 | `--qc-count` | `INT` | `All` | Limit the QC report to check only the first `N` links. |
 | `--limit` | `INT` | `None` | Process only up to `N` folders from `links.txt`. |
@@ -71,6 +79,12 @@ python gdownloader.py --qc
 ---
 
 ## Examples
+
+- **Incremental sync on folders:**
+  ```bash
+  python gdownloader.py --update
+  python gdownloader.py --update --limit 5
+  ```
 
 - **Process folders 16 through 35:**
   ```bash

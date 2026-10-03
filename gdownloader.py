@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Production-ready Google Drive Folder Downloader & QC
+Production-ready Google Drive Folder Downloader & Incremental Updater
+- Incremental Update Mode (--update): scans remote Drive folders and downloads ONLY
+  new or modified files, skipping unchanged files (including large videos).
 - Modern User-Agent (prevents Google 403 Forbidden / bot blocks)
 - Smart Cookie Validation & Fallback (detects expired/stale cookies causing login redirects)
 - Fast resume/skip for already downloaded folders (avoids re-downloading completed gigabytes)
@@ -16,9 +18,11 @@ import time
 import re
 import logging
 import argparse
+import email.utils
 import http.cookiejar
 from pathlib import Path
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure UTF-8 output on Windows consoles to prevent charmap encoding errors
 if sys.platform == "win32":
@@ -42,6 +46,7 @@ RETRIES = 5
 FILE_RETRIES = 3
 QUIET = False
 SKIP_EXISTING = True  # Automatically skips folders that are already completely downloaded
+UPDATE_MODE = False   # Incremental update mode: check individual files
 
 WAIT_BETWEEN_DOWNLOADS = 5
 WAIT_ON_RATE_LIMIT = 45
@@ -119,6 +124,42 @@ def get_remote_folder_info(folder_id: str, timeout: int = 12) -> Tuple[Optional[
         return None, 0, False
 
 
+def get_remote_file_metadata(file_id: str, session: requests.Session) -> Tuple[int, Optional[float]]:
+    """
+    Returns (remote_size_bytes, remote_mtime_epoch) for a Google Drive file
+    without downloading the file payload.
+    """
+    url = f"https://drive.google.com/uc?id={file_id}"
+    try:
+        r = session.get(url, stream=True, allow_redirects=True, timeout=8)
+        content_type = r.headers.get("Content-Type", "")
+        size = int(r.headers.get("Content-Length", 0))
+        mtime = None
+        if "Last-Modified" in r.headers:
+            try:
+                mtime = email.utils.parsedate_to_datetime(r.headers["Last-Modified"]).timestamp()
+            except Exception:
+                pass
+
+        # Handle large file (>100MB) virus scan confirmation redirect
+        if "text/html" in content_type and size < 15000:
+            from gdown.download import get_url_from_gdrive_confirmation
+            try:
+                dl_url = get_url_from_gdrive_confirmation(r.text)
+                r2 = session.get(dl_url, stream=True, timeout=8)
+                size = int(r2.headers.get("Content-Length", 0))
+                if "Last-Modified" in r2.headers:
+                    mtime = email.utils.parsedate_to_datetime(r2.headers["Last-Modified"]).timestamp()
+                r2.close()
+            except Exception:
+                pass
+
+        r.close()
+        return size, mtime
+    except Exception:
+        return 0, None
+
+
 def validate_cookies_file(cookies_path: Path) -> bool:
     """
     Validates if cookies.txt contains an active, valid Google Drive session.
@@ -158,11 +199,35 @@ def is_folder_complete(folder_path: Path) -> bool:
     return has_video or has_metadata
 
 
+def sanitize_filename(filename: str) -> str:
+    filename = filename.replace("\x00", "")
+    filename = filename.replace("/", "_").replace("\\", "_").strip()
+    return filename if filename not in ("", ".", "..") else "_"
+
+
 def find_existing_folder_for_title(title: str) -> Optional[Path]:
-    """Finds matching folder in OUTPUT_DIR by title."""
+    """
+    Finds matching folder in OUTPUT_DIR by title, tolerating sanitized filenames
+    and common numbering/custom prefixes (e.g. 'D1 ', 'D3 ').
+    """
+    # 1. Exact match
+    exact = OUTPUT_DIR / title
+    if exact.is_dir():
+        return exact
+
+    sanitized = sanitize_filename(title)
+    sanitized_dir = OUTPUT_DIR / sanitized
+    if sanitized_dir.is_dir():
+        return sanitized_dir
+
+    # 2. Match ignoring custom prefixes
+    clean_title = re.sub(r"^(D\d+|part\s*\d+)\s*", "", title, flags=re.IGNORECASE).strip()
     for item in OUTPUT_DIR.iterdir():
         if item.is_dir() and not item.name.endswith("_FAILED"):
-            if item.name == title or (len(title) > 20 and title[:25] in item.name):
+            clean_item = re.sub(r"^(D\d+|part\s*\d+)\s*", "", item.name, flags=re.IGNORECASE).strip()
+            if clean_item == clean_title:
+                return item
+            if len(clean_title) > 20 and (clean_title[:25] in clean_item or clean_item[:25] in clean_title):
                 return item
     return None
 
@@ -208,17 +273,127 @@ def is_rate_limit_error(error_msg: str) -> bool:
     return any(k in error_msg for k in keywords)
 
 
-def download_folder(url: str, index: int, total: int, use_cookies: bool) -> Tuple[bool, bool]:
+def update_folder_incremental(url: str, index: int, total: int, use_cookies: bool) -> Tuple[bool, bool]:
+    """
+    Incrementally checks a folder for new or modified files:
+    - Scans remote folder hierarchy on Google Drive
+    - Compares each file against local disk (size and modification time)
+    - Downloads ONLY new or changed files
+    - Skips already up-to-date files (including large videos)
+    Returns:
+        (success: bool, was_skipped: bool)
+    """
+    logger.info(f"[{index}/{total}] [UPDATE] Checking folder -> {url}")
+    folder_id = extract_folder_id(url)
+    output_path = str(OUTPUT_DIR) + "\\"
+
+    remote_title, _, _ = get_remote_folder_info(folder_id)
+    if not remote_title:
+        remote_title = f"folder_{folder_id[:12]}"
+
+    matched_dir = find_existing_folder_for_title(remote_title)
+    if not matched_dir or not matched_dir.exists():
+        logger.info(f"[{index}/{total}] [UPDATE] Folder not found locally. Performing initial full download...")
+        return download_folder(url, index, total, use_cookies=use_cookies, update_mode=False)
+
+    # 1. Discover all remote files in the folder hierarchy
+    try:
+        remote_files = gdown.download_folder(
+            url=url,
+            output=output_path,
+            skip_download=True,
+            quiet=True,
+            use_cookies=use_cookies,
+            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+            user_agent=USER_AGENT,
+        )
+    except Exception as e:
+        logger.warning(f"[{index}/{total}] [UPDATE] Failed to discover remote files: {e}. Falling back to standard mode.")
+        return download_folder(url, index, total, use_cookies=use_cookies, update_mode=False)
+
+    if not remote_files:
+        logger.warning(f"[{index}/{total}] [UPDATE] No remote files discovered. Skipping.")
+        return True, True
+
+    # 2. Check each file against local storage in parallel
+    logger.info(f"[{index}/{total}] [UPDATE] Checking {len(remote_files)} files in '{matched_dir.name[:35]}'...")
+
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+
+    to_download = []
+
+    def check_file(f):
+        lp = matched_dir / f.path
+        if not lp.exists():
+            candidates = list(matched_dir.rglob(Path(f.path).name))
+            if candidates:
+                lp = candidates[0]
+            else:
+                return f, lp, "NEW_FILE", 0, None
+        l_size = lp.stat().st_size
+        l_mtime = lp.stat().st_mtime
+        r_size, r_mtime = get_remote_file_metadata(f.id, session)
+        if r_size > 0 and r_size != l_size:
+            return f, lp, f"SIZE_DIFF ({l_size}B -> {r_size}B)", r_size, r_mtime
+        if r_mtime and r_mtime > l_mtime + 5:
+            return f, lp, "TIME_MODIFIED (newer on Drive)", r_size, r_mtime
+        return f, lp, "UP_TO_DATE", r_size, r_mtime
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(check_file, remote_files))
+
+    for f, lp, status, r_size, r_mtime in results:
+        if status != "UP_TO_DATE":
+            to_download.append((f, lp, status, r_size, r_mtime))
+
+    if not to_download:
+        logger.info(
+            f"[{index}/{total}] [UPDATE] '{matched_dir.name[:40]}' is 100% UP TO DATE ({len(remote_files)} files verified). Skipped."
+        )
+        return True, True
+
+    # 3. Download only the new or updated files
+    logger.info(f"[{index}/{total}] [UPDATE] Found {len(to_download)} file(s) to update in '{matched_dir.name[:35]}':")
+    updated_count = 0
+    for f, lp, reason, r_size, r_mtime in to_download:
+        logger.info(f"  -> Updating: {f.path} [{reason}]")
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            gdown.download(
+                url=f"https://drive.google.com/uc?id={f.id}",
+                output=str(lp),
+                quiet=QUIET,
+                use_cookies=use_cookies,
+                user_agent=USER_AGENT,
+            )
+            if r_mtime:
+                try:
+                    os.utime(lp, (r_mtime, r_mtime))
+                except Exception:
+                    pass
+            updated_count += 1
+        except Exception as e:
+            logger.warning(f"  [!] Failed to update {f.path}: {e}")
+
+    logger.info(f"[{index}/{total}] [UPDATE] Completed: {updated_count}/{len(to_download)} file(s) downloaded.")
+    return True, False
+
+
+def download_folder(url: str, index: int, total: int, use_cookies: bool, update_mode: bool = False) -> Tuple[bool, bool]:
     """
     Downloads folder using gdown with modern User-Agent and strict success checking.
     Returns:
         (success: bool, was_skipped: bool)
     """
+    if update_mode:
+        return update_folder_incremental(url, index, total, use_cookies)
+
     logger.info(f"[{index}/{total}] Checking -> {url}")
     folder_id = extract_folder_id(url)
     output_path = str(OUTPUT_DIR) + "\\"
 
-    # 1. Check if already downloaded
+    # 1. Check if already downloaded (standard fast-skip mode)
     if SKIP_EXISTING:
         remote_title, _, _ = get_remote_folder_info(folder_id)
         if remote_title:
@@ -255,7 +430,6 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool) -> Tupl
                 return True, False
             else:
                 logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} -> No files downloaded (returned empty list)")
-                # If cookies were on and returned 0 files, switch them off for subsequent attempts
                 if active_use_cookies:
                     logger.warning(f"[{index}/{total}] Cookies returned 0 files (login redirect likely). Disabling cookies for next attempt...")
                     active_use_cookies = False
@@ -345,9 +519,10 @@ def run_qc(sample_count: Optional[int] = None):
 
 
 def main():
-    global SKIP_EXISTING, WAIT_BETWEEN_DOWNLOADS, RETRIES, QUIET
+    global SKIP_EXISTING, WAIT_BETWEEN_DOWNLOADS, RETRIES, QUIET, UPDATE_MODE
 
     parser = argparse.ArgumentParser(description="Google Drive Folder Downloader & QC")
+    parser.add_argument("--update", action="store_true", help="Incremental update mode: check for new or modified files in Drive folders and download ONLY changed/new files (skips unchanged files).")
     parser.add_argument("--qc", action="store_true", help="Run QC report on downloaded folders")
     parser.add_argument("--qc-count", type=int, default=None, help="Number of links to check in QC (default: all)")
     parser.add_argument("--limit", type=int, default=None, help="Process up to N folders from links.txt")
@@ -359,6 +534,8 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress download progress output")
     args = parser.parse_args()
 
+    if args.update:
+        UPDATE_MODE = True
     if args.no_skip:
         SKIP_EXISTING = False
     if args.wait is not None:
@@ -375,7 +552,10 @@ def main():
     logger.info("=" * 70)
     logger.info("Google Drive Folder Downloader (Enhanced & Resilient Version)")
     logger.info("- Smart cookie validation & automatic fallback")
-    logger.info(f"- Fast resume/skip for existing folders: {'ENABLED' if SKIP_EXISTING else 'DISABLED'}")
+    if UPDATE_MODE:
+        logger.info("- Mode: INCREMENTAL UPDATE (--update enabled: syncing modified & new files)")
+    else:
+        logger.info(f"- Mode: FAST SKIP (Skip existing complete folders: {'ENABLED' if SKIP_EXISTING else 'DISABLED'})")
     logger.info("- Modern browser User-Agent (avoids 403 blocks)")
     logger.info(f"- Folder retries: {RETRIES} | Wait between downloads: {WAIT_BETWEEN_DOWNLOADS}s")
     logger.info(f"- Output folder : {OUTPUT_DIR}")
@@ -404,7 +584,7 @@ def main():
     logger.info(f"Found {total} folder link(s) in {LINKS_FILE.name}")
 
     start_idx = max(1, args.start)
-    end_idx = min(total, start_idx + args.limit) if args.limit is not None else total
+    end_idx = min(total, start_idx + args.limit - 1) if args.limit is not None else total
 
     target_items = list(enumerate(all_links, 1))[start_idx - 1:end_idx]
     logger.info(f"Processing folders from index [{start_idx}] to [{end_idx}] (Total to check: {len(target_items)})")
@@ -414,7 +594,7 @@ def main():
 
     for idx, (i, url) in enumerate(target_items, 1):
         logger.info("-" * 70)
-        ok, skipped = download_folder(url, i, total, use_cookies=use_cookies)
+        ok, skipped = download_folder(url, i, total, use_cookies=use_cookies, update_mode=UPDATE_MODE)
         if ok:
             success += 1
         else:
