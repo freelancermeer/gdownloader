@@ -124,15 +124,61 @@ def get_remote_folder_info(folder_id: str, timeout: int = 12) -> Tuple[Optional[
         return None, 0, False
 
 
-def get_remote_file_metadata(file_id: str, session: requests.Session) -> Tuple[int, Optional[float]]:
+def get_remote_file_metadata(file_id: str, session: requests.Session) -> Tuple[Optional[int], Optional[float], bool]:
     """
-    Returns (remote_size_bytes, remote_mtime_epoch) for a Google Drive file
-    without downloading the file payload.
+    Returns (remote_size_bytes, remote_mtime_epoch, is_quota_exceeded) for a Google Drive file.
+    Guarantees that HTML error pages (Quota exceeded, login redirects) are NEVER mistaken for file sizes.
     """
     url = f"https://drive.google.com/uc?id={file_id}"
     try:
-        r = session.get(url, stream=True, allow_redirects=True, timeout=8)
-        content_type = r.headers.get("Content-Type", "")
+        r = session.get(url, stream=True, allow_redirects=True, timeout=12)
+        content_type = r.headers.get("Content-Type", "").lower()
+
+        # Check if Google served an HTML response instead of a binary file
+        if "text/html" in content_type:
+            html_text = r.text[:3000]
+            r.close()
+
+            # 1. Quota Exceeded / Rate Limit check
+            if (
+                "Quota exceeded" in html_text
+                or "Too many users have viewed or downloaded this file recently" in html_text
+                or "download quota" in html_text.lower()
+            ):
+                return None, None, True
+
+            # 2. ServiceLogin / Auth Redirect check
+            if "ServiceLogin" in html_text or "accounts.google.com" in html_text:
+                return None, None, False
+
+            # 3. Large File Virus Scan Warning
+            if "Virus scan warning" in html_text or "confirm=" in html_text or "download_warning" in html_text:
+                from gdown.download import get_url_from_gdrive_confirmation
+                try:
+                    dl_url = get_url_from_gdrive_confirmation(html_text)
+                    r2 = session.get(dl_url, stream=True, timeout=12)
+                    ct2 = r2.headers.get("Content-Type", "").lower()
+                    if "text/html" in ct2:
+                        h2 = r2.text[:3000]
+                        r2.close()
+                        is_q = "Quota exceeded" in h2 or "Too many users" in h2
+                        return None, None, is_q
+                    size = int(r2.headers.get("Content-Length", 0))
+                    mtime = None
+                    if "Last-Modified" in r2.headers:
+                        try:
+                            mtime = email.utils.parsedate_to_datetime(r2.headers["Last-Modified"]).timestamp()
+                        except Exception:
+                            pass
+                    r2.close()
+                    if size > 0:
+                        return size, mtime, False
+                except Exception:
+                    return None, None, False
+
+            return None, None, False
+
+        # Direct binary stream
         size = int(r.headers.get("Content-Length", 0))
         mtime = None
         if "Last-Modified" in r.headers:
@@ -140,24 +186,10 @@ def get_remote_file_metadata(file_id: str, session: requests.Session) -> Tuple[i
                 mtime = email.utils.parsedate_to_datetime(r.headers["Last-Modified"]).timestamp()
             except Exception:
                 pass
-
-        # Handle large file (>100MB) virus scan confirmation redirect
-        if "text/html" in content_type and size < 15000:
-            from gdown.download import get_url_from_gdrive_confirmation
-            try:
-                dl_url = get_url_from_gdrive_confirmation(r.text)
-                r2 = session.get(dl_url, stream=True, timeout=8)
-                size = int(r2.headers.get("Content-Length", 0))
-                if "Last-Modified" in r2.headers:
-                    mtime = email.utils.parsedate_to_datetime(r2.headers["Last-Modified"]).timestamp()
-                r2.close()
-            except Exception:
-                pass
-
         r.close()
-        return size, mtime
+        return (size if size > 0 else None), mtime, False
     except Exception:
-        return 0, None
+        return None, None, False
 
 
 def validate_cookies_file(cookies_path: Path) -> bool:
@@ -360,21 +392,30 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
                 if candidates:
                     lp = candidates[0]
                 else:
-                    return f, lp, "NEW_FILE", 0, None
+                    r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session)
+                    if is_quota:
+                        return f, lp, "QUOTA_EXCEEDED", None, None
+                    return f, lp, "NEW_FILE", r_size, r_mtime
+
             l_size = lp.stat().st_size
             l_mtime = lp.stat().st_mtime
-            r_size, r_mtime = get_remote_file_metadata(f.id, session)
+            r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session)
 
-            if r_size > 0 and r_size != l_size:
+            if is_quota:
+                # File already exists locally. Remote is temporarily quota-locked by Google.
+                # Keep existing file safe and do NOT attempt to re-download HTML error page!
+                return f, lp, "UP_TO_DATE", l_size, l_mtime
+
+            if r_size is not None and r_size > 0 and r_size != l_size:
                 return f, lp, f"SIZE_DIFF ({l_size}B -> {r_size}B)", r_size, r_mtime
+
             if r_mtime and r_mtime > l_mtime + 2:
                 return f, lp, "TIME_MODIFIED (newer on Drive)", r_size, r_mtime
-            if r_size == 0 and l_size < 1024 * 1024:
-                return f, lp, "UNVERIFIED_SMALL_FILE", r_size, r_mtime
-            return f, lp, "UP_TO_DATE", r_size, r_mtime
+
+            return f, lp, "UP_TO_DATE", r_size or l_size, r_mtime or l_mtime
         except Exception as err:
             logger.warning(f"Error inspecting {getattr(f, 'path', str(f))}: {err}")
-            return f, matched_dir / getattr(f, "path", str(f)), "CHECK_ERROR", 0, None
+            return f, matched_dir / getattr(f, "path", str(f)), "CHECK_ERROR", None, None
 
     results = []
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -402,6 +443,9 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
     logger.info(f"[{index}/{total}] [UPDATE] Found {len(to_download)} file(s) to update in '{matched_dir.name[:35]}':")
     updated_count = 0
     for f, lp, reason, r_size, r_mtime in to_download:
+        if "QUOTA_EXCEEDED" in reason:
+            logger.warning(f"  [!] Skipped {f.path}: Google Drive download quota exceeded on remote file (try again later).")
+            continue
         logger.info(f"  -> Updating: {f.path} [{reason}]")
         lp.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -419,6 +463,12 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
                 except Exception:
                     pass
             updated_count += 1
+        except (FileURLRetrievalError, DownloadError) as e:
+            err_str = str(e)
+            if "Too many users" in err_str or "quota" in err_str.lower():
+                logger.warning(f"  [!] Quota exceeded for {f.path}. Existing local file preserved.")
+            else:
+                logger.warning(f"  [!] Failed to update {f.path}: {err_str.splitlines()[0] if err_str else e}")
         except Exception as e:
             logger.warning(f"  [!] Failed to update {f.path}: {e}")
 
