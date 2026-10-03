@@ -20,6 +20,8 @@ import logging
 import argparse
 import email.utils
 import http.cookiejar
+import json
+import urllib.parse
 from pathlib import Path
 from typing import List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -124,14 +126,194 @@ def get_remote_folder_info(folder_id: str, timeout: int = 12) -> Tuple[Optional[
         return None, 0, False
 
 
+def is_os_junk_file(path_str: str) -> bool:
+    """Checks if a file is an OS junk metadata file (.DS_Store, Thumbs.db, desktop.ini)."""
+    name = Path(path_str).name.lower()
+    return name in [".ds_store", "thumbs.db", "desktop.ini", ".spotlight-v100", ".trashes"] or name.startswith("._")
+
+
+def is_image_file(path_str: str) -> bool:
+    """Checks if a file is an image format."""
+    return any(path_str.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".ico"])
+
+
+def is_text_file(path_str: str) -> bool:
+    """Checks if a file is a text/metadata format."""
+    return any(path_str.lower().endswith(ext) for ext in [".txt", ".md", ".json", ".csv", ".xml", ".yaml", ".yml"])
+
+
+def download_image_via_cdn(file_id: str, out_path: Path, session: Optional[requests.Session] = None) -> bool:
+    """
+    Downloads an image file directly from Google high-speed CDN.
+    Completely bypasses the Google Drive 24-hour quota limit.
+    """
+    cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+    headers = {"User-Agent": USER_AGENT}
+    sess = session or requests.Session()
+    try:
+        r = sess.get(cdn_url, headers=headers, stream=True, timeout=15)
+        ct = r.headers.get("Content-Type", "").lower()
+        if r.status_code == 200 and "image/" in ct:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+            return True
+    except Exception as e:
+        logger.debug(f"CDN image download failed for {file_id}: {e}")
+    return False
+
+
+def download_text_via_viewer(file_id: str, session: Optional[requests.Session] = None) -> Optional[str]:
+    """
+    Extracts text/metadata content from Google Drive Viewer.
+    Completely bypasses 24h quota limits on .txt, .md, .json, .csv files.
+    """
+    url = f"https://drive.google.com/file/d/{file_id}/view"
+    headers = {"User-Agent": USER_AGENT}
+    sess = session or requests.Session()
+    try:
+        r = sess.get(url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            return None
+        idx = r.text.find(r"\u0026dsmi\u003dtexmex")
+        if idx == -1:
+            return None
+        start = r.text.rfind('"', 0, idx)
+        end = r.text.find('"', idx)
+        if start == -1 or end == -1:
+            return None
+        full_url = r.text[start + 1 : end].encode("utf-8").decode("unicode_escape")
+        resp = sess.get(full_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data_start = resp.text.find("{")
+        if data_start == -1:
+            return None
+        data = json.loads(resp.text[data_start:])
+        page_rel = data.get("page")
+        if not page_rel:
+            return None
+        page_url = urllib.parse.urljoin("https://drive.google.com/viewer/", page_rel)
+        rv = sess.get(page_url, headers=headers, timeout=10)
+        if rv.status_code != 200:
+            return None
+        text_data_start = rv.text.find("{")
+        if text_data_start == -1:
+            return None
+        text_data = json.loads(rv.text[text_data_start:])
+        return text_data.get("data")
+    except Exception as e:
+        logger.debug(f"Viewer text extraction error for {file_id}: {e}")
+        return None
+
+
+def download_single_file_resilient(
+    file_id: str,
+    rel_path: str,
+    target_path: Path,
+    session: requests.Session,
+    use_cookies: bool,
+    expected_mtime: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """
+    Downloads a single file using multi-strategy resilience:
+    1. OS junk files (.DS_Store, Thumbs.db) -> Skipped
+    2. Images -> Download via Google high-speed CDN (bypasses 24h quota)
+    3. Text/Markdown/JSON -> Standard download with automatic Drive Viewer fallback on quota limit
+    4. Binaries/Videos -> Standard download with confirmation parsing & error resilience
+    Returns:
+        (success: bool, reason: str)
+    """
+    if is_os_junk_file(rel_path):
+        return True, "SKIPPED_JUNK"
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Images via Google CDN (quota bypass)
+    if is_image_file(rel_path):
+        if download_image_via_cdn(file_id, target_path, session):
+            if expected_mtime:
+                try:
+                    os.utime(target_path, (expected_mtime, expected_mtime))
+                except Exception:
+                    pass
+            return True, "CDN"
+
+    # 2. Text / Metadata files (with Drive Viewer fallback)
+    if is_text_file(rel_path):
+        try:
+            gdown.download(
+                url=f"https://drive.google.com/uc?id={file_id}",
+                output=str(target_path),
+                quiet=True,
+                use_cookies=use_cookies,
+                cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+                user_agent=USER_AGENT,
+            )
+            if target_path.exists() and target_path.stat().st_size > 0:
+                if expected_mtime:
+                    try:
+                        os.utime(target_path, (expected_mtime, expected_mtime))
+                    except Exception:
+                        pass
+                return True, "STANDARD"
+        except Exception:
+            pass
+
+        # Viewer extraction fallback
+        text_content = download_text_via_viewer(file_id, session)
+        if text_content is not None:
+            with open(target_path, "w", encoding="utf-8") as out_f:
+                out_f.write(text_content)
+            if expected_mtime:
+                try:
+                    os.utime(target_path, (expected_mtime, expected_mtime))
+                except Exception:
+                    pass
+            return True, "VIEWER_FALLBACK"
+
+    # 3. Binaries / Videos
+    try:
+        gdown.download(
+            url=f"https://drive.google.com/uc?id={file_id}",
+            output=str(target_path),
+            quiet=QUIET,
+            use_cookies=use_cookies,
+            cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
+            user_agent=USER_AGENT,
+        )
+        if target_path.exists() and target_path.stat().st_size > 0:
+            if expected_mtime:
+                try:
+                    os.utime(target_path, (expected_mtime, expected_mtime))
+                except Exception:
+                    pass
+            return True, "STANDARD"
+        return False, "EMPTY_DOWNLOAD"
+    except (FileURLRetrievalError, DownloadError) as e:
+        err_str = str(e)
+        if "Too many users" in err_str or "quota" in err_str.lower():
+            if target_path.exists() and target_path.stat().st_size > 10 * 1024 * 1024:
+                return True, "QUOTA_EXCEEDED_PRESERVED_LOCAL"
+            return False, "QUOTA_EXCEEDED"
+        return False, f"ERROR: {err_str.splitlines()[0] if err_str else e}"
+    except Exception as e:
+        return False, f"ERROR: {e}"
+
+
 def get_remote_file_metadata(file_id: str, session: requests.Session, filename: str = "") -> Tuple[Optional[int], Optional[float], bool]:
     """
     Returns (remote_size_bytes, remote_mtime_epoch, is_quota_exceeded) for a Google Drive file.
     Guarantees that HTML error pages (Quota exceeded, login redirects) are NEVER mistaken for file sizes.
     For images, queries Google's high-speed CDN to bypass 24h download quota limits completely.
+    For text files, uses Drive Viewer extraction when quota is hit.
     """
-    is_image = any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
-    if is_image:
+    if is_os_junk_file(filename):
+        return None, None, False
+
+    if is_image_file(filename):
         try:
             cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"
             cdn_r = session.head(cdn_url, allow_redirects=True, timeout=8)
@@ -159,6 +341,10 @@ def get_remote_file_metadata(file_id: str, session: requests.Session, filename: 
                 or "Too many users have viewed or downloaded this file recently" in html_text
                 or "download quota" in html_text.lower()
             ):
+                if is_text_file(filename):
+                    content = download_text_via_viewer(file_id, session)
+                    if content is not None:
+                        return len(content.encode("utf-8")), None, False
                 return None, None, True
 
             # 2. ServiceLogin / Auth Redirect check
@@ -231,10 +417,11 @@ def validate_cookies_file(cookies_path: Path) -> bool:
 def is_folder_complete(folder_path: Path) -> bool:
     """
     Checks if a local directory contains complete downloaded folder assets.
+    Must contain a valid video (> 10MB) AND metadata/images.
     """
     if not folder_path.is_dir():
         return False
-    files = [f for f in folder_path.rglob("*") if f.is_file()]
+    files = [f for f in folder_path.rglob("*") if f.is_file() and not is_os_junk_file(f.name)]
     if len(files) < 4:
         return False
     has_video = any(
@@ -242,7 +429,7 @@ def is_folder_complete(folder_path: Path) -> bool:
         for f in files
     )
     has_metadata = any(f.name in ["title.txt", "description.txt", "info.txt"] for f in files)
-    return has_video or has_metadata
+    return has_video and has_metadata
 
 
 def sanitize_filename(filename: str) -> str:
@@ -400,6 +587,9 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
 
     def check_file(f):
         try:
+            if is_os_junk_file(f.path):
+                return f, matched_dir / f.path, "UP_TO_DATE", 0, None
+
             lp = matched_dir / f.path
             if not lp.exists():
                 candidates = [p for p in matched_dir.rglob("*") if p.is_file() and p.name.lower() == Path(f.path).name.lower()]
@@ -407,7 +597,7 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
                     lp = candidates[0]
                 else:
                     r_size, r_mtime, is_quota = get_remote_file_metadata(f.id, session, filename=f.path)
-                    if is_quota:
+                    if is_quota and not (is_image_file(f.path) or is_text_file(f.path)):
                         return f, lp, "QUOTA_EXCEEDED", None, None
                     return f, lp, "NEW_FILE", r_size, r_mtime
 
@@ -457,63 +647,41 @@ def update_folder_incremental(url: str, index: int, total: int, use_cookies: boo
     logger.info(f"[{index}/{total}] [UPDATE] Found {len(to_download)} file(s) to update in '{matched_dir.name[:35]}':")
     updated_count = 0
     for f, lp, reason, r_size, r_mtime in to_download:
+        if is_os_junk_file(f.path):
+            continue
         if "QUOTA_EXCEEDED" in reason:
             logger.warning(f"  [!] Skipped {f.path}: Google Drive download quota exceeded on remote file (try again later).")
             continue
         logger.info(f"  -> Updating: {f.path} [{reason}]")
-        lp.parent.mkdir(parents=True, exist_ok=True)
+        ok, res_reason = download_single_file_resilient(
+            file_id=f.id,
+            rel_path=f.path,
+            target_path=lp,
+            session=session,
+            use_cookies=use_cookies,
+            expected_mtime=r_mtime,
+        )
+        if ok:
+            updated_count += 1
+            if res_reason != "QUOTA_EXCEEDED_PRESERVED_LOCAL":
+                logger.info(f"     Updated {f.path} successfully [{res_reason}].")
+        else:
+            if "QUOTA_EXCEEDED" in res_reason:
+                logger.warning(f"  [!] Quota exceeded for {f.path}. Existing local file preserved.")
+            else:
+                logger.warning(f"  [!] Failed to update {f.path}: {res_reason}")
 
-        # For images, download directly from Google high-speed CDN to bypass quota limits
-        is_image = any(str(lp).lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"])
-        downloaded = False
-        if is_image:
-            try:
-                cdn_url = f"https://lh3.googleusercontent.com/d/{f.id}"
-                cdn_res = session.get(cdn_url, stream=True, timeout=15)
-                ct = cdn_res.headers.get("Content-Type", "").lower()
-                if cdn_res.status_code == 200 and "image/" in ct:
-                    with open(lp, "wb") as out_f:
-                        for chunk in cdn_res.iter_content(chunk_size=32768):
-                            if chunk:
-                                out_f.write(chunk)
-                    cdn_res.close()
-                    downloaded = True
-                    updated_count += 1
-            except Exception:
-                pass
-
-        if not downloaded:
-            try:
-                gdown.download(
-                    url=f"https://drive.google.com/uc?id={f.id}",
-                    output=str(lp),
-                    quiet=QUIET,
-                    use_cookies=use_cookies,
-                    cookies_file=str(COOKIES_FILE) if (use_cookies and COOKIES_FILE.exists()) else None,
-                    user_agent=USER_AGENT,
-                )
-                if r_mtime:
-                    try:
-                        os.utime(lp, (r_mtime, r_mtime))
-                    except Exception:
-                        pass
-                updated_count += 1
-            except (FileURLRetrievalError, DownloadError) as e:
-                err_str = str(e)
-                if "Too many users" in err_str or "quota" in err_str.lower():
-                    logger.warning(f"  [!] Quota exceeded for {f.path}. Existing local file preserved.")
-                else:
-                    logger.warning(f"  [!] Failed to update {f.path}: {err_str.splitlines()[0] if err_str else e}")
-            except Exception as e:
-                logger.warning(f"  [!] Failed to update {f.path}: {e}")
-
-    logger.info(f"[{index}/{total}] [UPDATE] Completed: {updated_count}/{len(to_download)} file(s) downloaded.")
+    logger.info(f"[{index}/{total}] [UPDATE] Completed: {updated_count}/{len(to_download)} file(s) processed.")
     return True, False
 
 
 def download_folder(url: str, index: int, total: int, use_cookies: bool, update_mode: bool = False) -> Tuple[bool, bool]:
     """
-    Downloads folder using gdown with modern User-Agent and strict success checking.
+    Downloads folder using resilient multi-strategy downloader:
+    - Bypasses 24h Google Drive quota on images via Google CDN
+    - Bypasses 24h quota on text/metadata via Google Drive Viewer API
+    - Silently filters out OS junk (.DS_Store, Thumbs.db)
+    - Resiliently handles large video confirmation tokens
     Returns:
         (success: bool, was_skipped: bool)
     """
@@ -524,73 +692,142 @@ def download_folder(url: str, index: int, total: int, use_cookies: bool, update_
     folder_id = extract_folder_id(url)
     output_path = str(OUTPUT_DIR) + "\\"
 
-    # 1. Check if already downloaded (standard fast-skip mode)
-    if SKIP_EXISTING:
-        remote_title, _, _ = get_remote_folder_info(folder_id)
-        if remote_title:
-            matched_dir = find_existing_folder_for_title(remote_title)
-            if matched_dir and is_folder_complete(matched_dir):
-                files = [f for f in matched_dir.rglob("*") if f.is_file()]
-                size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
-                logger.info(
-                    f"[{index}/{total}] ALREADY COMPLETED -> '{matched_dir.name[:45]}' "
-                    f"({len(files)} files, {size_mb:.1f} MB). Skipping."
-                )
-                clean_failed_marker(index, url)
-                return True, True
+    remote_title, _, _ = get_remote_folder_info(folder_id)
+    if not remote_title:
+        remote_title = f"folder_{folder_id[:12]}"
 
-    # 2. Attempt download with retries
+    matched_dir = find_existing_folder_for_title(remote_title)
+    if not matched_dir:
+        matched_dir = OUTPUT_DIR / sanitize_filename(remote_title)
+
+    # 1. Fast skip if already completely downloaded
+    if SKIP_EXISTING and matched_dir.exists() and is_folder_complete(matched_dir):
+        files = [f for f in matched_dir.rglob("*") if f.is_file() and not is_os_junk_file(f.name)]
+        size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
+        logger.info(
+            f"[{index}/{total}] ALREADY COMPLETED -> '{matched_dir.name[:45]}' "
+            f"({len(files)} files, {size_mb:.1f} MB). Skipping."
+        )
+        clean_failed_marker(index, url)
+        return True, True
+
+    # 2. Discover remote files
     active_use_cookies = use_cookies
-    for attempt in range(1, RETRIES + 1):
+    remote_files = None
+    for disc_attempt in range(1, 4):
         try:
-            result = gdown.download_folder(
+            remote_files = gdown.download_folder(
+                url=url,
+                output=output_path,
+                skip_download=True,
+                quiet=True,
+                use_cookies=active_use_cookies,
+                cookies_file=str(COOKIES_FILE) if (active_use_cookies and COOKIES_FILE.exists()) else None,
+                user_agent=USER_AGENT,
+            )
+            if remote_files and len(remote_files) > 0:
+                break
+            elif active_use_cookies:
+                # Expired or redirected cookies returned 0 files -> fallback to public discovery
+                active_use_cookies = False
+        except Exception:
+            if active_use_cookies:
+                active_use_cookies = False
+            time.sleep(2)
+
+    if not remote_files:
+        logger.warning(f"[{index}/{total}] Remote discovery returned 0 files. Falling back to direct gdown.")
+        try:
+            res = gdown.download_folder(
                 url=url,
                 output=output_path,
                 quiet=QUIET,
-                use_cookies=active_use_cookies,
-                cookies_file=str(COOKIES_FILE) if (active_use_cookies and COOKIES_FILE.exists()) else None,
+                use_cookies=False,
                 resume=True,
                 retries=FILE_RETRIES,
                 user_agent=USER_AGENT,
             )
-
-            # Strict check: only count as success if we got a non-empty list of downloaded files
-            if isinstance(result, list) and len(result) > 0:
-                logger.info(f"[{index}/{total}] SUCCESS -> Downloaded {len(result)} files")
+            if res and len(res) > 0:
                 clean_failed_marker(index, url)
                 return True, False
-            else:
-                logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} -> No files downloaded (returned empty list)")
-                if active_use_cookies:
-                    logger.warning(f"[{index}/{total}] Cookies returned 0 files (login redirect likely). Disabling cookies for next attempt...")
-                    active_use_cookies = False
-                wait = min(2 ** attempt + 4, 30)
-                time.sleep(wait)
-
-        except (DownloadError, FileURLRetrievalError) as e:
-            error_msg = str(e)
-            logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} failed: {error_msg}")
-
-            if is_rate_limit_error(error_msg):
-                logger.warning(f"[{index}/{total}] Rate limit detected. Waiting {WAIT_ON_RATE_LIMIT}s...")
-                time.sleep(WAIT_ON_RATE_LIMIT)
-            else:
-                wait = min(2 ** attempt + 6, 60)
-                logger.info(f"[{index}/{total}] Retrying in {wait} seconds...")
-                time.sleep(wait)
-
         except Exception as e:
-            error_msg = str(e)
-            logger.warning(f"[{index}/{total}] Attempt {attempt}/{RETRIES} unexpected error: {error_msg}")
-            wait = min(2 ** attempt + 6, 60)
-            time.sleep(wait)
+            logger.error(f"[{index}/{total}] Direct gdown failed: {e}")
+        create_failed_marker(index, url)
+        return False, False
 
-    # 3. Graceful Failure marker
-    create_failed_marker(index, url)
-    return False, False
+    matched_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[{index}/{total}] Downloading '{matched_dir.name[:35]}' ({len(remote_files)} remote files discovered)...")
+
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+    if active_use_cookies and COOKIES_FILE.exists():
+        try:
+            cj = http.cookiejar.MozillaCookieJar(str(COOKIES_FILE))
+            cj.load()
+            session.cookies = cj
+        except Exception:
+            pass
+
+    downloaded_files = 0
+    quota_files = []
+
+    for f in remote_files:
+        if is_os_junk_file(f.path):
+            continue
+
+        target_file = matched_dir / f.path
+        if target_file.exists():
+            sz = target_file.stat().st_size
+            is_vid = any(target_file.suffix.lower().endswith(x) for x in [".mp4", ".mov", ".mkv"])
+            if (is_vid and sz > 10 * 1024 * 1024) or (not is_vid and sz > 0):
+                downloaded_files += 1
+                continue
+
+        ok, reason = download_single_file_resilient(
+            file_id=f.id,
+            rel_path=f.path,
+            target_path=target_file,
+            session=session,
+            use_cookies=active_use_cookies,
+        )
+
+        if ok:
+            downloaded_files += 1
+            if reason not in ["SKIPPED_JUNK", "QUOTA_EXCEEDED_PRESERVED_LOCAL"]:
+                logger.info(f"  + Downloaded: {f.path} [{reason}]")
+        else:
+            if "QUOTA_EXCEEDED" in reason:
+                quota_files.append(f.path)
+                logger.warning(f"  [!] Quota exceeded for {f.path} (Google temporary 24h limit).")
+            else:
+                logger.warning(f"  [!] Failed to download {f.path}: {reason}")
+
+    # Check completeness
+    local_files = [p for p in matched_dir.rglob("*") if p.is_file() and not is_os_junk_file(p.name)]
+    has_video = any(p.suffix.lower() in [".mp4", ".mov", ".mkv"] and p.stat().st_size > 10 * 1024 * 1024 for p in local_files)
+    has_meta = any(p.name in ["description.txt", "title.txt", "info.txt"] for p in local_files)
+
+    if has_video and has_meta:
+        logger.info(f"[{index}/{total}] SUCCESS -> '{matched_dir.name[:35]}' is complete ({len(local_files)} files).")
+        clean_failed_marker(index, url)
+        return True, False
+    elif has_meta and len(local_files) >= 5:
+        if quota_files:
+            logger.warning(
+                f"[{index}/{total}] PARTIAL SUCCESS -> '{matched_dir.name[:35]}': {len(local_files)} files saved "
+                f"(All images & metadata complete). Remote video is temporarily locked by Google 24h download quota."
+            )
+        else:
+            logger.info(f"[{index}/{total}] COMPLETED -> '{matched_dir.name[:35]}' ({len(local_files)} files saved).")
+        clean_failed_marker(index, url)
+        return True, False
+    else:
+        logger.error(f"[{index}/{total}] INCOMPLETE -> Only {len(local_files)} files downloaded for '{matched_dir.name[:35]}'.")
+        create_failed_marker(index, url)
+        return False, False
 
 
-def run_qc(sample_count: Optional[int] = None):
+def run_qc(sample_count: Optional[int] = None, start_idx: int = 1):
     """Quality Control check on downloaded data."""
     logger.info("=" * 70)
     logger.info("QUALITY CONTROL (QC) REPORT")
@@ -606,11 +843,11 @@ def run_qc(sample_count: Optional[int] = None):
     logger.info(f"Failed placeholder folders : {len(failed_dirs)}")
     logger.info("-" * 70)
 
-    target_links = links[:sample_count] if sample_count else links
+    target_items = list(enumerate(links, 1))[start_idx - 1 : sample_count] if sample_count else list(enumerate(links, 1))[start_idx - 1 :]
     passed = 0
     missing = 0
 
-    for i, url in enumerate(target_links, 1):
+    for i, url in target_items:
         fid = extract_folder_id(url)
         remote_title, remote_files, is_redir = get_remote_folder_info(fid)
         title_str = remote_title or f"folder_{fid[:12]}"
@@ -645,7 +882,7 @@ def run_qc(sample_count: Optional[int] = None):
         )
 
     logger.info("=" * 70)
-    logger.info(f"QC Summary: {passed} PASSED | {missing} MISSING | Checked: {len(target_links)}")
+    logger.info(f"QC Summary: {passed} PASSED | {missing} MISSING | Checked: {len(target_items)}")
     logger.info("=" * 70)
 
 
@@ -677,7 +914,7 @@ def main():
         QUIET = True
 
     if args.qc:
-        run_qc(sample_count=args.qc_count)
+        run_qc(sample_count=args.qc_count, start_idx=args.start)
         return
 
     logger.info("=" * 70)
@@ -744,7 +981,7 @@ def main():
     logger.info("=" * 70)
 
     # Run QC on processed items
-    run_qc(sample_count=end_idx)
+    run_qc(sample_count=end_idx, start_idx=start_idx)
 
     if failed > 0:
         sys.exit(1)

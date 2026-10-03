@@ -6,6 +6,10 @@ A resilient, production-ready bulk Google Drive folder downloader and Quality Co
 
 ## Features
 
+- **Google Drive Quota Bypass:** Bypasses Google's 24-hour rate limit ("Too many users have viewed or downloaded this file recently") using a multi-strategy engine:
+  - **High-Speed CDN for Images:** Downloads thumbnails and images directly via Google's high-speed CDN (`lh3.googleusercontent.com`), bypassing quota limits 100%.
+  - **Drive Viewer Stream for Text & Metadata:** Automatically falls back to Google Drive Viewer API extraction for `.txt`, `.json`, and `.md` files when direct downloads are rate-limited.
+  - **Silent OS Junk Filter:** Automatically filters out `.DS_Store`, `Thumbs.db`, and macOS system files so they never trigger quota errors or abort downloads.
 - **Automated Anti-Blocking:** Injects modern desktop User-Agents to prevent Google's 403 Forbidden / bot detection on direct downloads.
 - **Smart Cookie Validation:** Automatically checks if `cookies.txt` has valid active tokens or causes a redirect to Google ServiceLogin, gracefully falling back to public mode if cookies are stale.
 - **Incremental Folder Sync (`--update`):** Queries remote file metadata (size and modification timestamp) and downloads only modified or newly added files, while skipping already up-to-date large media files.
